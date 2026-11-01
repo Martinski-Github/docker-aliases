@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# dls - human readable docker ps.
+#
+#   dls            running containers
+#   dls -a         all containers, including stopped ones
+#   dls --filter name=web   any other docker ps option works too
+#
+# Columns: PROJECT  NAME  STATUS  UPTIME  IP  PORTS  RESTARTS
+set -euo pipefail
+
+FORMAT='{{index .Config.Labels "com.docker.compose.project"}}|{{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.State.StartedAt}}|{{range .NetworkSettings.Networks}}{{.IPAddress}} {{end}}|{{range $p, $c := .NetworkSettings.Ports}}{{range $c}}{{.HostPort}}->{{$p}} {{end}}{{end}}|{{.RestartCount}}'
+
+if [ -t 1 ]; then
+  BOLD=$'\033[1m' RED=$'\033[31m' GREEN=$'\033[32m' YELLOW=$'\033[33m' RESET=$'\033[0m'
+else
+  BOLD='' RED='' GREEN='' YELLOW='' RESET=''
+fi
+
+human_duration() {
+  local s=$1
+  if   (( s >= 86400 )); then printf '%dd %dh' $((s / 86400)) $((s % 86400 / 3600))
+  elif (( s >= 3600 ));  then printf '%dh %dm' $((s / 3600)) $((s % 3600 / 60))
+  elif (( s >= 60 ));    then printf '%dm' $((s / 60))
+  else                        printf '%ds' "$s"
+  fi
+}
+
+status_color() {
+  case $1 in
+    *unhealthy*|exited*|dead*)       printf '%s' "$RED" ;;
+    *starting*|restarting*|paused*)  printf '%s' "$YELLOW" ;;
+    running*)                        printf '%s' "$GREEN" ;;
+  esac
+}
+
+ids=$(docker ps -q "$@")
+if [ -z "$ids" ]; then
+  echo "No containers."
+  exit 0
+fi
+
+now=$(date +%s)
+rows=()
+# shellcheck disable=SC2086  # $ids is a list of container IDs
+while IFS='|' read -r project name state health started ips ports restarts; do
+  status=$state
+  if [ -n "$health" ]; then
+    status="$state ($health)"
+  fi
+
+  up=-
+  if [ "$state" = running ] && start_s=$(date -d "$started" +%s 2>/dev/null); then
+    up=$(human_duration $((now - start_s)))
+  fi
+
+  # IPv4 and IPv6 bindings list the same port twice; drop /tcp to save width.
+  ports=$(printf '%s\n' $ports | sed 's#/tcp$##' | awk 'NF && !seen[$0]++' | paste -sd, -)
+  ips=$(printf '%s\n' $ips | paste -sd, -)
+
+  rows+=("${project:--}|${name#/}|$status|$up|${ips:--}|${ports:--}|$restarts")
+done < <(docker inspect --format "$FORMAT" $ids)
+
+mapfile -t rows < <(printf '%s\n' "${rows[@]}" | sort -t'|' -k1,1 -k2,2)
+lines=("PROJECT|NAME|STATUS|UPTIME|IP|PORTS|RESTARTS" "${rows[@]}")
+
+widths=()
+for line in "${lines[@]}"; do
+  IFS='|' read -ra f <<<"$line"
+  for i in "${!f[@]}"; do
+    if (( ${#f[i]} > ${widths[i]:-0} )); then
+      widths[i]=${#f[i]}
+    fi
+  done
+done
+
+for n in "${!lines[@]}"; do
+  IFS='|' read -ra f <<<"${lines[n]}"
+  out=''
+  for i in "${!f[@]}"; do
+    color=''
+    if (( n == 0 )); then
+      color=$BOLD
+    elif (( i == 2 )); then
+      color=$(status_color "${f[i]}")
+    elif (( i == 6 )) && (( f[i] > 0 )); then
+      color=$YELLOW
+    fi
+    # Pad before adding color codes so the columns stay aligned.
+    out+="$color$(printf '%-*s' "${widths[i]}" "${f[i]}")${color:+$RESET}  "
+  done
+  printf '%s\n' "${out%"${out##*[! ]}"}"
+done
